@@ -12,7 +12,8 @@ let project = {
   currentBarIndex: 0,
   currentPage: 0,
   isPlaying: false,
-  playTimer: null
+  playTimer: null,
+  view: { scale: 1, panX: 0, panY: 0 }
 };
 
 // ===== STATE =====
@@ -21,8 +22,10 @@ let detailMode = false;
 let detailBarIndex = -1;
 let detailKeyframeIndex = 0;
 let detailKeyframes = [];
+let pinchState = null;
 const BARS_PER_PAGE = 8;
 const BEATS_PER_BAR = 8;
+let newBarCallback = null;
 
 // ===== DOM REFS =====
 const canvas = document.getElementById('stageCanvas');
@@ -50,6 +53,22 @@ function lerp(a, b, t) {
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
+}
+
+// ===== VIEW TRANSFORM HELPERS =====
+function clientToCanvas(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const sx = canvas.width / rect.width;
+  const sy = canvas.height / rect.height;
+  return { x: (clientX - rect.left) * sx, y: (clientY - rect.top) * sy };
+}
+
+function screenToWorld(screenX, screenY) {
+  const v = project.view;
+  return {
+    x: (screenX - v.panX) / v.scale,
+    y: (screenY - v.panY) / v.scale
+  };
 }
 
 // ===== DRAW SHAPES =====
@@ -160,11 +179,17 @@ function updateDancer(id, data) {
 }
 
 // ===== BAR MANAGEMENT =====
-function addBar(number) {
-  const positions = {};
-  project.dancers.forEach(d => {
-    positions[d.id] = { x: project.stage.width / 2, y: project.stage.height / 2 };
-  });
+function addBar(number, copyFromLast) {
+  let positions;
+  if (copyFromLast && project.bars.length > 0) {
+    const lastBar = project.bars[project.bars.length - 1];
+    positions = JSON.parse(JSON.stringify(lastBar.positions));
+  } else {
+    positions = {};
+    project.dancers.forEach(d => {
+      positions[d.id] = { x: project.stage.width / 2, y: project.stage.height / 2 };
+    });
+  }
   const bar = {
     id: uid(),
     number: number || project.bars.length + 1,
@@ -205,6 +230,12 @@ function renderStage() {
   // background
   ctx.fillStyle = '#0a0a18';
   ctx.fillRect(0, 0, w, h);
+
+  // apply view transform
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.translate(project.view.panX, project.view.panY);
+  ctx.scale(project.view.scale, project.view.scale);
 
   // stage area (centered with padding)
   const padding = 40;
@@ -286,6 +317,8 @@ function renderStage() {
     drawShape(ctx, px, py, r, dancer.shape, dancer.color, 1);
     drawDancerLabel(ctx, px, py, dancer.name, 1);
   });
+
+  ctx.restore();
 
   // bar title
   barTitle.textContent = `第 ${bar.number} 小節`;
@@ -492,40 +525,28 @@ function endDrag(e) {
   // check if drop on canvas
   const rect = canvas.getBoundingClientRect();
   if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
-    // convert to stage coordinates
-    const cw = canvas.width, ch = canvas.height;
+    const cc = clientToCanvas(x, y);
+    const wc = screenToWorld(cc.x, cc.y);
+
     const padding = 40;
-    const sw = cw - padding * 2;
-    const sh = ch - padding * 2;
+    const sw = canvas.width - padding * 2;
+    const sh = canvas.height - padding * 2;
 
-    const canvasX = (x - rect.left) * (cw / rect.width);
-    const canvasY = (y - rect.top) * (ch / rect.height);
+    const stageX = ((wc.x - padding) / sw) * project.stage.width;
+    const stageY = ((wc.y - padding) / sh) * project.stage.height;
 
-    // check if within stage
-    if (canvasX >= padding && canvasX <= padding + sw && canvasY >= padding && canvasY <= padding + sh) {
-      const stageX = ((canvasX - padding) / sw) * project.stage.width;
-      const stageY = ((canvasY - padding) / sh) * project.stage.height;
+    const bar = project.bars[project.currentBarIndex];
+    bar.positions[dragState.dancerId] = { x: stageX, y: stageY };
 
-      const bar = project.bars[project.currentBarIndex];
-      bar.positions[dragState.dancerId] = {
-        x: clamp(stageX, 0, project.stage.width),
-        y: clamp(stageY, 0, project.stage.height)
-      };
-
-      // sync with keyframes for current bar
-      if (bar.keyframes) {
-        bar.keyframes.forEach(kf => {
-          if (kf.positions[dragState.dancerId]) {
-            kf.positions[dragState.dancerId] = {
-              x: clamp(stageX, 0, project.stage.width),
-              y: clamp(stageY, 0, project.stage.height)
-            };
-          }
-        });
-      }
-
-      renderAll();
+    if (bar.keyframes) {
+      bar.keyframes.forEach(kf => {
+        if (kf.positions[dragState.dancerId]) {
+          kf.positions[dragState.dancerId] = { x: stageX, y: stageY };
+        }
+      });
     }
+
+    renderAll();
   }
 
   dragState = null;
@@ -536,11 +557,10 @@ let canvasDrag = null;
 
 canvas.addEventListener('pointerdown', e => {
   if (project.isPlaying) return;
-  const rect = canvas.getBoundingClientRect();
-  const x = (e.clientX - rect.left) * (canvas.width / rect.width);
-  const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+  const cc = clientToCanvas(e.clientX, e.clientY);
+  const wc = screenToWorld(cc.x, cc.y);
 
-  const hit = hitTestDancer(x, y);
+  const hit = hitTestDancer(wc.x, wc.y);
   if (hit) {
     canvasDrag = {
       dancerId: hit.dancerId,
@@ -555,24 +575,19 @@ canvas.addEventListener('pointerdown', e => {
 
 canvas.addEventListener('pointermove', e => {
   if (!canvasDrag) return;
-  const rect = canvas.getBoundingClientRect();
-  const x = (e.clientX - rect.left) * (canvas.width / rect.width);
-  const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+  const cc = clientToCanvas(e.clientX, e.clientY);
+  const wc = screenToWorld(cc.x, cc.y);
 
-  // convert to stage coords
   const padding = 40;
   const sw = canvas.width - padding * 2;
   const sh = canvas.height - padding * 2;
   const sx = padding, sy = padding;
 
-  const stageX = ((x - sx) / sw) * project.stage.width;
-  const stageY = ((y - sy) / sh) * project.stage.height;
+  const stageX = ((wc.x - sx) / sw) * project.stage.width;
+  const stageY = ((wc.y - sy) / sh) * project.stage.height;
 
   const bar = project.bars[project.currentBarIndex];
-  bar.positions[canvasDrag.dancerId] = {
-    x: clamp(stageX, 0, project.stage.width),
-    y: clamp(stageY, 0, project.stage.height)
-  };
+  bar.positions[canvasDrag.dancerId] = { x: stageX, y: stageY };
 
   renderStage();
 });
@@ -591,6 +606,60 @@ canvas.addEventListener('pointerleave', () => {
     canvas.style.cursor = 'default';
     renderAll();
   }
+});
+
+// ===== PINCH TO ZOOM =====
+canvas.addEventListener('touchstart', e => {
+  if (e.touches.length === 2) {
+    e.preventDefault();
+    const t = e.touches;
+    pinchState = {
+      dist: Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY),
+      midX: (t[0].clientX + t[1].clientX) / 2,
+      midY: (t[0].clientY + t[1].clientY) / 2,
+      startScale: project.view.scale,
+      startPanX: project.view.panX,
+      startPanY: project.view.panY
+    };
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchmove', e => {
+  if (!pinchState || e.touches.length !== 2) return;
+  e.preventDefault();
+  const t = e.touches;
+  const newDist = Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  const newMidX = (t[0].clientX + t[1].clientX) / 2;
+  const newMidY = (t[0].clientY + t[1].clientY) / 2;
+
+  const scaleFactor = newDist / pinchState.dist;
+  const newScale = clamp(pinchState.startScale * scaleFactor, 0.2, 5);
+
+  // Adjust pan so the pinch center stays fixed
+  const cc = clientToCanvas(newMidX, newMidY);
+  const wc = screenToWorld(cc.x, cc.y);
+  project.view.scale = newScale;
+  project.view.panX = cc.x - wc.x * newScale;
+  project.view.panY = cc.y - wc.y * newScale;
+
+  renderStage();
+}, { passive: false });
+
+canvas.addEventListener('touchend', e => {
+  if (pinchState && e.touches.length < 2) {
+    if (e.touches.length === 1) {
+      // Cancel touch to let pointer events take over
+    }
+    pinchState = null;
+  }
+});
+
+// Reset zoom with double-tap
+canvas.addEventListener('dblclick', e => {
+  project.view.scale = 1;
+  project.view.panX = 0;
+  project.view.panY = 0;
+  renderStage();
 });
 
 function hitTestDancer(x, y) {
@@ -950,10 +1019,7 @@ detailCanvas.addEventListener('pointermove', e => {
 
   const kf = detailKeyframes[detailKeyframeIndex];
   if (kf && kf.positions[detailDrag.dancerId]) {
-    kf.positions[detailDrag.dancerId] = {
-      x: clamp(stageX, 0, project.stage.width),
-      y: clamp(stageY, 0, project.stage.height)
-    };
+    kf.positions[detailDrag.dancerId] = { x: stageX, y: stageY };
     renderDetailCanvas();
   }
 });
@@ -1085,9 +1151,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
   document.getElementById('addBar').addEventListener('click', () => {
     const num = project.bars.length + 1;
-    addBar(num);
-    project.currentBarIndex = project.bars.length - 1;
-    renderAll();
+    document.getElementById('newBarNum').textContent = num;
+    document.getElementById('newBarOverlay').classList.remove('hidden');
+    newBarCallback = copyFromLast => {
+      addBar(num, copyFromLast);
+      project.currentBarIndex = project.bars.length - 1;
+      renderAll();
+      document.getElementById('newBarOverlay').classList.add('hidden');
+    };
   });
 
   // Add dancer
@@ -1114,6 +1185,18 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('detailClose').addEventListener('click', closeDetail);
   document.getElementById('detailAddKey').addEventListener('click', addKeyframe);
   document.getElementById('detailDelKey').addEventListener('click', removeKeyframe);
+
+  // New bar dialog
+  document.getElementById('newBarCopy').addEventListener('click', () => {
+    if (newBarCallback) newBarCallback(true);
+  });
+  document.getElementById('newBarEmpty').addEventListener('click', () => {
+    if (newBarCallback) newBarCallback(false);
+  });
+  document.getElementById('newBarCancel').addEventListener('click', () => {
+    document.getElementById('newBarOverlay').classList.add('hidden');
+    newBarCallback = null;
+  });
 
   // Keyboard shortcuts
   document.addEventListener('keydown', e => {
