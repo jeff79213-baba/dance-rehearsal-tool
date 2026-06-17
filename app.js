@@ -23,6 +23,7 @@ let detailBarIndex = -1;
 let detailKeyframeIndex = 0;
 let detailKeyframes = [];
 let pinchState = null;
+let isPinching = false;
 const BARS_PER_PAGE = 8;
 const BEATS_PER_BAR = 8;
 let newBarCallback = null;
@@ -379,8 +380,15 @@ function renderTimeline() {
 
     renderMiniBar(cvs, bar, project.dancers);
 
-    div.addEventListener('click', () => selectBar(i));
-    div.addEventListener('dblclick', () => openDetail(i));
+    let _tapTimer = null;
+    div.addEventListener('click', () => {
+      if (_tapTimer) {
+        clearTimeout(_tapTimer); _tapTimer = null;
+        openDetail(i);
+      } else {
+        _tapTimer = setTimeout(() => { _tapTimer = null; selectBar(i); }, 280);
+      }
+    });
 
     tlBars.appendChild(div);
   }
@@ -456,6 +464,11 @@ function renderDancerList() {
         startDragFromSidebar(e, dancer);
       }
     });
+    div.addEventListener('touchstart', e => {
+      if (e.target !== del && e.target !== cp && e.target !== ss) {
+        startDragFromSidebar(e, dancer);
+      }
+    }, { passive: false });
 
     dancerList.appendChild(div);
   });
@@ -483,6 +496,7 @@ function goToBar(delta) {
 
 // ===== DRAG & DROP =====
 function startDragFromSidebar(e, dancer) {
+  if (dragState) return;
   e.preventDefault();
   const ghost = document.createElement('div');
   ghost.className = 'drag-ghost';
@@ -552,39 +566,49 @@ function endDrag(e) {
   dragState = null;
 }
 
-// ===== CANVAS DRAG (reposition dancers on stage) =====
+// ===== CANVAS DRAG & DOUBLE-TAP ZOOM RESET =====
 let canvasDrag = null;
+let lastTapTime = 0;
+let lastTapPos = null;
 
 canvas.addEventListener('pointerdown', e => {
-  if (project.isPlaying) return;
+  if (project.isPlaying || isPinching) return;
+
   const cc = clientToCanvas(e.clientX, e.clientY);
   const wc = screenToWorld(cc.x, cc.y);
 
+  // double-tap detection for zoom reset
+  const now = Date.now();
+  if (lastTapPos && (now - lastTapTime < 350) &&
+      Math.abs(wc.x - lastTapPos.x) < 30 && Math.abs(wc.y - lastTapPos.y) < 30) {
+    lastTapTime = 0; lastTapPos = null;
+    project.view.scale = 1; project.view.panX = 0; project.view.panY = 0;
+    renderStage();
+    return;
+  }
+  lastTapTime = now;
+  lastTapPos = { x: wc.x, y: wc.y };
+
+  // dancer hit test
   const hit = hitTestDancer(wc.x, wc.y);
   if (hit) {
-    canvasDrag = {
-      dancerId: hit.dancerId,
-      offsetX: x - hit.px,
-      offsetY: y - hit.py,
-      startX: hit.px,
-      startY: hit.py
-    };
+    canvasDrag = { dancerId: hit.dancerId };
     canvas.style.cursor = 'grabbing';
+    canvas.setPointerCapture(e.pointerId);
   }
 });
 
 canvas.addEventListener('pointermove', e => {
-  if (!canvasDrag) return;
+  if (!canvasDrag || isPinching) return;
   const cc = clientToCanvas(e.clientX, e.clientY);
   const wc = screenToWorld(cc.x, cc.y);
 
   const padding = 40;
   const sw = canvas.width - padding * 2;
   const sh = canvas.height - padding * 2;
-  const sx = padding, sy = padding;
 
-  const stageX = ((wc.x - sx) / sw) * project.stage.width;
-  const stageY = ((wc.y - sy) / sh) * project.stage.height;
+  const stageX = ((wc.x - padding) / sw) * project.stage.width;
+  const stageY = ((wc.y - padding) / sh) * project.stage.height;
 
   const bar = project.bars[project.currentBarIndex];
   bar.positions[canvasDrag.dancerId] = { x: stageX, y: stageY };
@@ -592,51 +616,49 @@ canvas.addEventListener('pointermove', e => {
   renderStage();
 });
 
-canvas.addEventListener('pointerup', () => {
-  if (canvasDrag) {
+canvas.addEventListener('pointerup', e => {
+  if (canvasDrag && !isPinching) {
     canvasDrag = null;
     canvas.style.cursor = 'default';
     renderAll();
   }
 });
 
-canvas.addEventListener('pointerleave', () => {
-  if (canvasDrag) {
-    canvasDrag = null;
-    canvas.style.cursor = 'default';
-    renderAll();
-  }
+canvas.addEventListener('pointercancel', e => {
+  canvasDrag = null;
+  canvas.style.cursor = 'default';
 });
 
-// ===== PINCH TO ZOOM =====
+// ===== PINCH TO ZOOM (touch only) =====
 canvas.addEventListener('touchstart', e => {
-  if (e.touches.length === 2) {
+  if (e.touches.length >= 2) {
+    isPinching = true;
+    canvasDrag = null;
+    canvas.style.cursor = 'default';
     e.preventDefault();
     const t = e.touches;
     pinchState = {
-      dist: Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY),
-      midX: (t[0].clientX + t[1].clientX) / 2,
-      midY: (t[0].clientY + t[1].clientY) / 2,
-      startScale: project.view.scale,
-      startPanX: project.view.panX,
-      startPanY: project.view.panY
+      baseDist: Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY),
+      baseScale: project.view.scale,
+      basePanX: project.view.panX,
+      basePanY: project.view.panY,
+      baseMidX: (t[0].clientX + t[1].clientX) / 2,
+      baseMidY: (t[0].clientY + t[1].clientY) / 2
     };
   }
 }, { passive: false });
 
 canvas.addEventListener('touchmove', e => {
-  if (!pinchState || e.touches.length !== 2) return;
+  if (!pinchState || e.touches.length < 2) { e.preventDefault(); return; }
   e.preventDefault();
   const t = e.touches;
-  const newDist = Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
-  const newMidX = (t[0].clientX + t[1].clientX) / 2;
-  const newMidY = (t[0].clientY + t[1].clientY) / 2;
+  const dist = Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+  const midX = (t[0].clientX + t[1].clientX) / 2;
+  const midY = (t[0].clientY + t[1].clientY) / 2;
 
-  const scaleFactor = newDist / pinchState.dist;
-  const newScale = clamp(pinchState.startScale * scaleFactor, 0.2, 5);
+  const newScale = clamp(pinchState.baseScale * (dist / pinchState.baseDist), 0.2, 5);
 
-  // Adjust pan so the pinch center stays fixed
-  const cc = clientToCanvas(newMidX, newMidY);
+  const cc = clientToCanvas(midX, midY);
   const wc = screenToWorld(cc.x, cc.y);
   project.view.scale = newScale;
   project.view.panX = cc.x - wc.x * newScale;
@@ -646,20 +668,10 @@ canvas.addEventListener('touchmove', e => {
 }, { passive: false });
 
 canvas.addEventListener('touchend', e => {
-  if (pinchState && e.touches.length < 2) {
-    if (e.touches.length === 1) {
-      // Cancel touch to let pointer events take over
-    }
+  if (e.touches.length < 2) {
+    isPinching = false;
     pinchState = null;
   }
-});
-
-// Reset zoom with double-tap
-canvas.addEventListener('dblclick', e => {
-  project.view.scale = 1;
-  project.view.panX = 0;
-  project.view.panY = 0;
-  renderStage();
 });
 
 function hitTestDancer(x, y) {
@@ -703,6 +715,12 @@ document.addEventListener('touchmove', e => {
 
 document.addEventListener('touchend', e => {
   if (dragState) endDrag(e);
+});
+document.addEventListener('touchcancel', e => {
+  if (dragState) {
+    if (dragState.ghost) document.body.removeChild(dragState.ghost);
+    dragState = null;
+  }
 });
 
 // ===== PLAYBACK =====
